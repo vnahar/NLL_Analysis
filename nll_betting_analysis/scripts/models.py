@@ -1,13 +1,21 @@
 """
 NLL Betting Analysis - Prediction Models
-Custom implementations without sklearn
+Simulation-based approach using period-level negative binomial distribution
+
+MIGRATION NOTE:
+- Original logistic regression model backed up to models_logistic_backup.py
+- This file now uses simulation-based prediction
+- API maintained for compatibility with existing code
 """
 
 import json
 from pathlib import Path
 import statistics
 import math
-import random
+
+# Import simulation model
+from simulation_models import NegativeBinomialSimulator, SimulationBasedPredictor
+
 
 class DataSplitter:
     """Handle train/test splits with temporal ordering"""
@@ -23,6 +31,27 @@ class DataSplitter:
             'train': data[:train_end],
             'val': data[train_end:val_end],
             'test': data[val_end:]
+        }
+
+    @staticmethod
+    def temporal_split_by_season(data, train_seasons, test_seasons):
+        """
+        Split data by season IDs for stricter temporal separation
+
+        Args:
+            data: List of match records with 'season_id' field
+            train_seasons: List of season IDs for training (e.g., [221, 222, 223])
+            test_seasons: List of season IDs for testing (e.g., [224])
+
+        Returns:
+            Dict with 'train' and 'test' keys
+        """
+        train = [d for d in data if d.get('season_id') in train_seasons]
+        test = [d for d in data if d.get('season_id') in test_seasons]
+
+        return {
+            'train': train,
+            'test': test
         }
 
 
@@ -48,8 +77,8 @@ class BaselineModel:
 
         return {'predictions': predictions, 'mae': mae, 'rmse': rmse, 'avg_spread': avg_spread}
 
-    def predict_total_sum_of_avgs(self, train_data, test_data):
-        """Predict using average total"""
+    def predict_total_historical_avg(self, train_data, test_data):
+        """Predict using historical average total"""
         avg_total = statistics.mean([d['total'] for d in train_data if d['total'] is not None])
 
         predictions = [avg_total for _ in test_data]
@@ -61,465 +90,200 @@ class BaselineModel:
         return {'predictions': predictions, 'mae': mae, 'rmse': rmse, 'avg_total': avg_total}
 
 
-class WeightedScoringModel:
-    """Weighted feature scoring model based on correlations"""
-
-    def __init__(self):
-        self.weights = {}
-        self.threshold = 0.5
-
-    def train_moneyline(self, train_data, features):
-        """Train using feature correlations"""
-        print("  Training weighted scoring model for moneyline...")
-
-        # Calculate weights from correlations
-        for feature in features:
-            values = [d[feature] for d in train_data if d.get(feature) is not None]
-            targets = [d['home_win'] for d in train_data if d.get(feature) is not None]
-
-            if len(values) < 10:
-                continue
-
-            # Simple correlation
-            corr = self._correlation(values, targets)
-            self.weights[feature] = corr
-
-        print(f"    Learned {len(self.weights)} feature weights")
-
-    def predict_moneyline(self, test_data, features):
-        """Predict using weighted sum"""
-        predictions = []
-
-        for sample in test_data:
-            score = 0
-            weight_sum = 0
-
-            for feature in features:
-                if feature in self.weights and sample.get(feature) is not None:
-                    # Normalize feature value
-                    val = sample[feature]
-                    score += self.weights[feature] * val
-                    weight_sum += abs(self.weights[feature])
-
-            # Normalize score
-            if weight_sum > 0:
-                score = score / weight_sum
-
-            # Predict home win if score > threshold
-            pred = 1 if score > 0 else 0
-            predictions.append(pred)
-
-        actuals = [d['home_win'] for d in test_data]
-        accuracy = sum(1 for p, a in zip(predictions, actuals) if p == a) / len(actuals)
-
-        return {'predictions': predictions, 'accuracy': accuracy}
-
-    def train_spread(self, train_data, features):
-        """Train spread predictor"""
-        print("  Training weighted scoring model for spread...")
-
-        for feature in features:
-            values = [d[feature] for d in train_data if d.get(feature) is not None]
-            targets = [d['spread'] for d in train_data if d.get(feature) is not None]
-
-            if len(values) < 10:
-                continue
-
-            corr = self._correlation(values, targets)
-            self.weights[feature] = corr
-
-        print(f"    Learned {len(self.weights)} feature weights")
-
-    def predict_spread(self, test_data, features):
-        """Predict spread using weighted sum"""
-        predictions = []
-
-        for sample in test_data:
-            score = 0
-            weight_sum = 0
-
-            for feature in features:
-                if feature in self.weights and sample.get(feature) is not None:
-                    val = sample[feature]
-                    score += self.weights[feature] * val
-                    weight_sum += abs(self.weights[feature])
-
-            # Scale to spread range
-            if weight_sum > 0:
-                score = score / weight_sum * 5  # Scale factor
-
-            predictions.append(score)
-
-        actuals = [d['spread'] for d in test_data]
-        mae = statistics.mean([abs(p - a) for p, a in zip(predictions, actuals)])
-        rmse = math.sqrt(statistics.mean([(p - a)**2 for p, a in zip(predictions, actuals)]))
-
-        return {'predictions': predictions, 'mae': mae, 'rmse': rmse}
-
-    def train_total(self, train_data, features):
-        """Train total predictor"""
-        print("  Training weighted scoring model for total...")
-
-        # Start with average as base
-        self.base_total = statistics.mean([d['total'] for d in train_data])
-
-        for feature in features:
-            values = [d[feature] for d in train_data if d.get(feature) is not None]
-            targets = [d['total'] - self.base_total for d in train_data if d.get(feature) is not None]
-
-            if len(values) < 10:
-                continue
-
-            corr = self._correlation(values, targets)
-            self.weights[feature] = corr
-
-        print(f"    Learned {len(self.weights)} feature weights, base={self.base_total:.2f}")
-
-    def predict_total(self, test_data, features):
-        """Predict total using weighted sum + base"""
-        predictions = []
-
-        for sample in test_data:
-            adjustment = 0
-            weight_sum = 0
-
-            for feature in features:
-                if feature in self.weights and sample.get(feature) is not None:
-                    val = sample[feature]
-                    adjustment += self.weights[feature] * val
-                    weight_sum += abs(self.weights[feature])
-
-            # Scale adjustment
-            if weight_sum > 0:
-                adjustment = adjustment / weight_sum * 2  # Scale factor
-
-            pred = self.base_total + adjustment
-            predictions.append(pred)
-
-        actuals = [d['total'] for d in test_data]
-        mae = statistics.mean([abs(p - a) for p, a in zip(predictions, actuals)])
-        rmse = math.sqrt(statistics.mean([(p - a)**2 for p, a in zip(predictions, actuals)]))
-
-        return {'predictions': predictions, 'mae': mae, 'rmse': rmse}
-
-    def _correlation(self, x, y):
-        """Calculate correlation coefficient"""
-        if len(x) != len(y) or len(x) < 2:
-            return 0
-
-        mean_x = statistics.mean(x)
-        mean_y = statistics.mean(y)
-
-        numerator = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
-        denom_x = sum((xi - mean_x)**2 for xi in x)**0.5
-        denom_y = sum((yi - mean_y)**2 for yi in y)**0.5
-
-        if denom_x == 0 or denom_y == 0:
-            return 0
-
-        return numerator / (denom_x * denom_y)
-
-
-class SimpleLogisticRegression:
-    """Simple logistic regression using gradient descent"""
-
-    def __init__(self, learning_rate=0.01, iterations=1000):
-        self.lr = learning_rate
-        self.iterations = iterations
-        self.weights = {}
-        self.bias = 0
-
-    def _sigmoid(self, z):
-        """Sigmoid function with numerical stability"""
-        z = max(min(z, 500), -500)  # Clip to prevent overflow
-        return 1 / (1 + math.exp(-z))
-
-    def train(self, train_data, features):
-        """Train using gradient descent"""
-        print(f"  Training logistic regression for {self.iterations} iterations...")
-
-        # Initialize weights
-        for feature in features:
-            self.weights[feature] = random.uniform(-0.1, 0.1)
-
-        # Filter complete data
-        complete_data = [d for d in train_data if all(d.get(f) is not None for f in features)]
-        print(f"    Training on {len(complete_data)} complete samples")
-
-        # Gradient descent
-        for iteration in range(self.iterations):
-            # Calculate gradients
-            grad_weights = {f: 0 for f in features}
-            grad_bias = 0
-
-            for sample in complete_data:
-                # Forward pass
-                z = self.bias
-                for feature in features:
-                    z += self.weights[feature] * sample[feature]
-
-                pred = self._sigmoid(z)
-                error = pred - sample['home_win']
-
-                # Backward pass
-                grad_bias += error
-                for feature in features:
-                    grad_weights[feature] += error * sample[feature]
-
-            # Update weights
-            n = len(complete_data)
-            self.bias -= self.lr * grad_bias / n
-            for feature in features:
-                self.weights[feature] -= self.lr * grad_weights[feature] / n
-
-            if (iteration + 1) % 200 == 0:
-                # Calculate loss
-                loss = 0
-                for sample in complete_data:
-                    z = self.bias
-                    for feature in features:
-                        z += self.weights[feature] * sample[feature]
-                    pred = self._sigmoid(z)
-                    loss += -(sample['home_win'] * math.log(pred + 1e-10) +
-                            (1 - sample['home_win']) * math.log(1 - pred + 1e-10))
-                loss /= n
-                print(f"    Iteration {iteration+1}: Loss = {loss:.4f}")
-
-    def predict(self, test_data, features):
-        """Make predictions"""
-        predictions = []
-        probabilities = []
-
-        for sample in test_data:
-            # Check if all features available
-            if not all(sample.get(f) is not None for f in features):
-                predictions.append(1)  # Default to home win
-                probabilities.append(0.5)
-                continue
-
-            z = self.bias
-            for feature in features:
-                z += self.weights[feature] * sample[feature]
-
-            prob = self._sigmoid(z)
-            pred = 1 if prob > 0.5 else 0
-
-            predictions.append(pred)
-            probabilities.append(prob)
-
-        actuals = [d['home_win'] for d in test_data]
-        accuracy = sum(1 for p, a in zip(predictions, actuals) if p == a) / len(actuals)
-
-        return {
-            'predictions': predictions,
-            'probabilities': probabilities,
-            'accuracy': accuracy
-        }
-
-
-class ModelEvaluator:
-    """Evaluate and compare models"""
-
-    @staticmethod
-    def evaluate_moneyline(predictions, actuals):
-        """Calculate moneyline metrics"""
-        accuracy = sum(1 for p, a in zip(predictions, actuals) if p == a) / len(actuals)
-
-        # Calculate by class
-        home_correct = sum(1 for p, a in zip(predictions, actuals) if p == 1 and a == 1)
-        home_total = sum(1 for a in actuals if a == 1)
-        away_correct = sum(1 for p, a in zip(predictions, actuals) if p == 0 and a == 0)
-        away_total = sum(1 for a in actuals if a == 0)
-
-        home_precision = home_correct / sum(1 for p in predictions if p == 1) if sum(predictions) > 0 else 0
-        away_precision = away_correct / sum(1 for p in predictions if p == 0) if sum(1 for p in predictions if p == 0) > 0 else 0
-
-        return {
-            'accuracy': accuracy,
-            'home_precision': home_precision,
-            'away_precision': away_precision,
-            'home_recall': home_correct / home_total if home_total > 0 else 0,
-            'away_recall': away_correct / away_total if away_total > 0 else 0
-        }
-
-    @staticmethod
-    def evaluate_regression(predictions, actuals):
-        """Calculate regression metrics"""
-        mae = statistics.mean([abs(p - a) for p, a in zip(predictions, actuals)])
-        rmse = math.sqrt(statistics.mean([(p - a)**2 for p, a in zip(predictions, actuals)]))
-
-        # Within X goals
-        within_1 = sum(1 for p, a in zip(predictions, actuals) if abs(p - a) <= 1) / len(actuals)
-        within_2 = sum(1 for p, a in zip(predictions, actuals) if abs(p - a) <= 2) / len(actuals)
-        within_3 = sum(1 for p, a in zip(predictions, actuals) if abs(p - a) <= 3) / len(actuals)
-
-        return {
-            'mae': mae,
-            'rmse': rmse,
-            'within_1': within_1,
-            'within_2': within_2,
-            'within_3': within_3
-        }
+# Main model is now SimulationBasedPredictor (imported from simulation_models)
+# Keeping this wrapper for backward compatibility
+class NLLPredictionModel(SimulationBasedPredictor):
+    """
+    Main NLL prediction model using simulation approach
+    Wraps SimulationBasedPredictor for backward compatibility
+    """
+
+    def __init__(self, config_path=None):
+        """Initialize with simulation model"""
+        super().__init__(config_path)
+        print("NLL Prediction Model initialized with simulation approach")
+
+    def train_and_evaluate(self, features_data, train_seasons=None, test_seasons=None):
+        """
+        Complete training and evaluation pipeline
+
+        Args:
+            features_data: Path to features.json or list of feature dicts
+            train_seasons: List of season IDs for training (e.g., [221, 222, 223])
+            test_seasons: List of season IDs for testing (e.g., [224])
+
+        Returns:
+            Dict with training results and evaluation metrics
+        """
+        # Load features if path provided
+        if isinstance(features_data, (str, Path)):
+            with open(features_data, 'r') as f:
+                data = json.load(f)
+                # Handle nested structure
+                if isinstance(data, dict) and 'features' in data:
+                    features = data['features']
+                else:
+                    features = data
+        else:
+            features = features_data
+
+        print(f"\nLoaded {len(features)} matches with features")
+
+        # Split data by season if seasons provided
+        if train_seasons and test_seasons:
+            splits = DataSplitter.temporal_split_by_season(
+                features,
+                train_seasons,
+                test_seasons
+            )
+        else:
+            # Use default temporal split
+            splits = DataSplitter.temporal_split(features, train_ratio=0.7, val_ratio=0.15)
+
+        train_data = splits['train']
+        test_data = splits.get('test', [])
+
+        print(f"Train set: {len(train_data)} matches")
+        print(f"Test set: {len(test_data)} matches")
+
+        # Train simulation model (loads team parameters)
+        parameters_path = Path(__file__).parent.parent / 'data' / 'team_parameters.json'
+        self.train(parameters_path=parameters_path)
+
+        # Evaluate if test data available
+        if test_data:
+            print("\nEvaluating on test set...")
+
+            # Prepare test data for prediction
+            test_inputs = []
+            actuals = []
+
+            for match in test_data:
+                test_inputs.append({
+                    'match_id': match.get('match_id'),
+                    'home_team_id': match.get('home_team_id'),
+                    'away_team_id': match.get('away_team_id'),
+                    'context': {
+                        'back_to_back': match.get('home_back_to_back', False) or match.get('away_back_to_back', False),
+                        'streak': match.get('home_streak', 0)
+                    }
+                })
+
+                actuals.append({
+                    'winner': 'home' if match.get('home_win', 0) == 1 else 'away',
+                    'spread': match.get('spread', 0),
+                    'total': match.get('total', 0)
+                })
+
+            # Get predictions
+            predictions = self.predict(test_inputs)
+
+            # Calculate metrics
+            metrics = self.evaluate(test_inputs, actuals)
+
+            # Calculate calibration
+            calibration = self.calculate_calibration(predictions, actuals, n_bins=10)
+
+            print("\n" + "=" * 60)
+            print("EVALUATION RESULTS")
+            print("=" * 60)
+            print(f"Moneyline Accuracy: {metrics['moneyline_accuracy_pct']:.2f}%")
+            print(f"Log Loss: {metrics['log_loss']:.4f}")
+            print(f"Brier Score: {metrics['brier_score']:.4f}")
+            print(f"Expected Calibration Error: {calibration['expected_calibration_error']:.4f}")
+            print(f"Spread MAE: {metrics['spread_mae']:.2f} goals")
+            print(f"Total MAE: {metrics['total_mae']:.2f} goals")
+            print(f"Test matches: {metrics['n_predictions']}")
+            print("=" * 60)
+
+            # Print calibration curve
+            print("\nPROBABILITY CALIBRATION ANALYSIS")
+            print("=" * 60)
+            print(f"{'Predicted Range':<20} {'Actual Win Rate':<20} {'Count':<10} {'Error':<10}")
+            print("-" * 60)
+
+            for bin_data in calibration['calibration_curve']:
+                pred_range = bin_data['bin_range']
+                actual = bin_data['actual_win_rate']
+                count = bin_data['count']
+                error = bin_data['calibration_error']
+
+                print(f"{pred_range:<20} {actual:<20.3f} {count:<10} {error:<10.3f}")
+
+            print("=" * 60)
+
+            return {
+                'model_type': 'simulation',
+                'train_size': len(train_data),
+                'test_size': len(test_data),
+                'metrics': metrics,
+                'calibration': calibration,
+                'predictions': predictions
+            }
+        else:
+            return {
+                'model_type': 'simulation',
+                'train_size': len(train_data),
+                'test_size': 0,
+                'message': 'No test data available for evaluation'
+            }
+
+
+def train_and_save_model(features_path, output_path, train_seasons=None, test_seasons=None):
+    """
+    Train model and save results
+
+    Args:
+        features_path: Path to features.json
+        output_path: Path to save model results
+        train_seasons: List of season IDs for training
+        test_seasons: List of season IDs for testing
+    """
+    print("=" * 60)
+    print("NLL Simulation Model Training")
+    print("=" * 60)
+
+    # Initialize model
+    config_path = Path(__file__).parent.parent / 'data' / 'simulation_config.json'
+    model = NLLPredictionModel(config_path)
+
+    # Train and evaluate
+    results = model.train_and_evaluate(
+        features_path,
+        train_seasons=train_seasons,
+        test_seasons=test_seasons
+    )
+
+    # Save results
+    output_file = Path(output_path)
+    with open(output_file, 'w') as f:
+        # Remove predictions from saved results (too large)
+        save_results = {k: v for k, v in results.items() if k != 'predictions'}
+        json.dump(save_results, f, indent=2)
+
+    print(f"\nResults saved to {output_file}")
+
+    return results
 
 
 def main():
     """Main execution"""
-    print("="*60)
-    print("NLL BETTING ANALYSIS - MODEL TRAINING")
-    print("="*60)
+    features_path = Path(__file__).parent.parent / 'data' / 'features.json'
+    output_path = Path(__file__).parent.parent / 'data' / 'simulation_results.json'
 
-    data_dir = Path('/Users/vedantnahar/Downloads/AltSportsData/NLL_Analysis/nll_betting_analysis/data')
+    # Train on seasons 221-223 (2021-2024), test on season 224 (2024-2025)
+    results = train_and_save_model(
+        features_path,
+        output_path,
+        train_seasons=[221, 222, 223],
+        test_seasons=[224]
+    )
 
-    # Load features
-    print("\nLoading features...")
-    with open(data_dir / 'features.json', 'r') as f:
-        data = json.load(f)
-        features_data = data['features']
+    print("\n" + "=" * 60)
+    print("Training complete!")
+    print("=" * 60)
 
-    # Filter complete data
-    complete_data = [
-        f for f in features_data
-        if f.get('home_last5_avg_goals_for') is not None
-        and f.get('away_last5_avg_goals_for') is not None
-    ]
-    print(f"  ✓ Loaded {len(complete_data)} matches with complete features")
-
-    # Split data
-    print("\nSplitting data temporally...")
-    splits = DataSplitter.temporal_split(complete_data, train_ratio=0.7, val_ratio=0.15)
-    print(f"  Train: {len(splits['train'])} matches")
-    print(f"  Val:   {len(splits['val'])} matches")
-    print(f"  Test:  {len(splits['test'])} matches")
-
-    # Define top features from analysis (ORIGINAL - 58.33% accuracy)
-    moneyline_features = [
-        'home_last10_avg_goal_diff',
-        'home_last10_avg_goals_against',
-        'home_last10_win_pct',
-        'away_last10_avg_goal_diff',
-        'away_last10_win_pct',
-        'h2h_team1_win_pct',
-        'home_back_to_back',
-        'away_back_to_back',
-        'home_streak',
-        'away_streak'
-    ]
-
-    spread_features = [
-        'home_last10_avg_goal_diff',
-        'away_last10_avg_goal_diff',
-        'h2h_team1_win_pct',
-        'home_last10_avg_goals_against',
-        'away_last10_avg_goals_against',
-        'home_last10_win_pct',
-        'away_last10_win_pct',
-        'home_back_to_back',
-        'away_back_to_back'
-    ]
-
-    total_features = [
-        'home_last10_avg_goals_for',
-        'away_last10_avg_goals_for',
-        'home_last10_avg_goals_against',
-        'away_last10_avg_goals_against',
-        'away_last10_win_pct',
-        'home_last10_win_pct',
-        'week_number',
-        'away_rest_days',
-        'home_rest_days'
-    ]
-
-    results = {}
-
-    # MONEYLINE MODELS
-    print("\n" + "="*60)
-    print("MONEYLINE PREDICTION")
-    print("="*60)
-
-    # Baseline
-    print("\n1. Baseline (Always Home)")
-    baseline = BaselineModel()
-    bl_results = baseline.predict_moneyline_always_home(splits['test'])
-    print(f"   Accuracy: {bl_results['accuracy']*100:.2f}%")
-    results['moneyline_baseline'] = bl_results
-
-    # Weighted Scoring
-    print("\n2. Weighted Scoring Model")
-    ws_model = WeightedScoringModel()
-    ws_model.train_moneyline(splits['train'], moneyline_features)
-    ws_results = ws_model.predict_moneyline(splits['test'], moneyline_features)
-    print(f"   Accuracy: {ws_results['accuracy']*100:.2f}%")
-    results['moneyline_weighted'] = ws_results
-
-    # Logistic Regression
-    print("\n3. Logistic Regression")
-    lr_model = SimpleLogisticRegression(learning_rate=0.001, iterations=1000)
-    lr_model.train(splits['train'], moneyline_features)
-    lr_results = lr_model.predict(splits['test'], moneyline_features)
-    print(f"   Accuracy: {lr_results['accuracy']*100:.2f}%")
-    results['moneyline_logistic'] = lr_results
-
-    # SPREAD MODELS
-    print("\n" + "="*60)
-    print("POINT SPREAD PREDICTION")
-    print("="*60)
-
-    # Baseline
-    print("\n1. Baseline (Historical Average)")
-    spread_bl = baseline.predict_spread_historical_avg(splits['train'], splits['test'])
-    print(f"   MAE: {spread_bl['mae']:.2f} goals")
-    print(f"   RMSE: {spread_bl['rmse']:.2f} goals")
-    results['spread_baseline'] = spread_bl
-
-    # Weighted Scoring
-    print("\n2. Weighted Scoring Model")
-    ws_spread = WeightedScoringModel()
-    ws_spread.train_spread(splits['train'], spread_features)
-    ws_spread_results = ws_spread.predict_spread(splits['test'], spread_features)
-    print(f"   MAE: {ws_spread_results['mae']:.2f} goals")
-    print(f"   RMSE: {ws_spread_results['rmse']:.2f} goals")
-    results['spread_weighted'] = ws_spread_results
-
-    # TOTAL MODELS
-    print("\n" + "="*60)
-    print("TOTAL POINTS PREDICTION")
-    print("="*60)
-
-    # Baseline
-    print("\n1. Baseline (Average Total)")
-    total_bl = baseline.predict_total_sum_of_avgs(splits['train'], splits['test'])
-    print(f"   MAE: {total_bl['mae']:.2f} goals")
-    print(f"   RMSE: {total_bl['rmse']:.2f} goals")
-    results['total_baseline'] = total_bl
-
-    # Weighted Scoring
-    print("\n2. Weighted Scoring Model")
-    ws_total = WeightedScoringModel()
-    ws_total.train_total(splits['train'], total_features)
-    ws_total_results = ws_total.predict_total(splits['test'], total_features)
-    print(f"   MAE: {ws_total_results['mae']:.2f} goals")
-    print(f"   RMSE: {ws_total_results['rmse']:.2f} goals")
-    results['total_weighted'] = ws_total_results
-
-    # Save results
-    output_file = data_dir / 'model_results.json'
-
-    # Convert to serializable format
-    serializable_results = {}
-    for key, value in results.items():
-        serializable_results[key] = {}
-        for k, v in value.items():
-            if isinstance(v, list):
-                serializable_results[key][k] = v[:10]  # Save only first 10 predictions
-            else:
-                serializable_results[key][k] = v
-
-    with open(output_file, 'w') as f:
-        json.dump(serializable_results, f, indent=2)
-
-    print("\n" + "="*60)
-    print(f"✓ Results saved to {output_file}")
-    print("="*60)
+    return results
 
 
 if __name__ == '__main__':
